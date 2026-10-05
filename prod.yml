@@ -1,0 +1,250 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - environments/prod/*
+      - modules/*
+      - azure-pipelines.yml
+
+# Pipeline run karte waqt environment parameters
+parameters:
+  - name: environment
+    displayName: 'Select Environment'
+    type: string
+    default: 'prod'
+    allowed:
+      - prod
+
+pool:
+  name: agentvikrant
+
+# Prod environment ke specific variables
+variables:
+  terraformWorkingDirectory: '$(Build.SourcesDirectory)/environments/prod'
+  backendStorageAccount: 'backendstorageprodvik'  # Apne Prod Storage Account ka naam yahan badlein
+  backendKey: 'terraform-prod.tfstate'
+
+stages:
+# ============================================================
+# 1. TERRAFORM SECURITY SCAN
+# ============================================================
+- stage: TerraformSecurityScan
+  displayName: 'Prod - Terraform Security Scan'
+  jobs:
+  - job: tfsec
+    displayName: 'Run TFSEC'
+    steps:
+    - checkout: self
+      clean: true
+
+    - task: tfsec@1
+      displayName: 'Terraform Security Scan'
+      continueOnError: true
+      inputs:
+        version: 'v1.26.0'
+
+# ============================================================
+# 2. TFLINT (parallel)
+# ============================================================
+- stage: TerraformTFLint
+  displayName: 'Prod - TFlint'
+  jobs:
+  - job: TFLint
+    displayName: 'Run TFLint'
+    steps:
+    - checkout: self
+      clean: true
+    - powershell: |
+        $ErrorActionPreference = "Continue"
+        $tflint = "C:\Terraform\tflint.exe"
+        if (Test-Path $tflint) {
+          Set-Location "$(Build.SourcesDirectory)"
+          & $tflint --init
+          & $tflint --recursive
+        } else {
+          Write-Warning "TFLint binary not found. Skipping check."
+        }
+      displayName: 'Run TFLint Analyzer'
+
+# ============================================================
+# 3. CHECKOV
+# ============================================================
+- stage: TerraformCheckov
+  displayName: 'Prod - Checkov'
+  jobs:
+  - job: checkov
+    displayName: 'Run Checkov'
+    steps:
+    - checkout: self
+      clean: true
+   
+    - task: PublishTestResults@2
+      displayName: 'Publish Checkov Results'
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(Build.ArtifactStagingDirectory)/checkov/**/*.xml'
+        testRunTitle: 'Checkov Prod Terraform Scan'
+        failTaskOnFailedTests: false
+
+# ============================================================
+# 4. TRIVY
+# ============================================================
+- stage: TerraformTrivy
+  displayName: 'Prod - Trivy'
+  dependsOn: []
+  jobs:
+  - job: trivy
+    displayName: 'Run Trivy Config Scan'
+    steps:
+    - checkout: self
+      clean: true
+      displayName: 'Run Trivy'
+
+    - powershell: |
+        Write-Host "Sources dir : $(Build.SourcesDirectory)"
+        Write-Host "Work dir    : $(terraformWorkingDirectory)"
+        Write-Host "Work dir exists? " (Test-Path "$(terraformWorkingDirectory)")
+        Write-Host "terraform.exe exists? " (Test-Path "C:\Terraform\terraform.exe")
+        Write-Host "--- .tf files in repo ---"
+        Get-ChildItem "$(Build.SourcesDirectory)" -Recurse -Filter *.tf |
+          Select-Object -First 30 -ExpandProperty FullName
+      displayName: 'DEBUG paths'
+      
+# ============================================================
+# 5. TERRAFORM INIT + VALIDATE + PLAN
+# ============================================================
+- stage: TerraformPlan
+  displayName: 'Prod - Init Validate Plan'
+  dependsOn: TerraformSecurityScan
+
+  jobs:
+  - job: terraform_plan
+    displayName: 'Terraform Init Validate Plan'
+
+    steps:
+    - checkout: self
+      clean: true
+
+    # -------------------------
+    # Terraform Init
+    # -------------------------
+    - task: TerraformTask@5
+      displayName: 'Terraform Init (Prod)'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        backendServiceArm: 'vikrantsc1'  # Agar Prod ke liye alag Service Connection hai toh yahan badlein
+        backendAzureRmResourceGroupName: 'RG-Vikrant'
+        backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+        backendAzureRmContainerName: 'backendcontainer'
+        backendAzureRmKey: '$(backendKey)'
+
+    # -------------------------
+    # Terraform Validate
+    # -------------------------
+    - task: TerraformTask@5
+      displayName: 'Terraform Validate'
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+        workingDirectory: '$(terraformWorkingDirectory)'
+
+    # -------------------------
+    # Terraform Plan
+    # -------------------------
+    - task: TerraformTask@5
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: 'vikrantsc1'
+        commandOptions: '-out=$(Build.ArtifactStagingDirectory)/tfplan'
+
+    # -------------------------
+    # Publish Terraform Plan
+    # -------------------------
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Prod Plan'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/tfplan'
+        artifact: 'terraform-plan-prod'
+
+# ============================================================
+# 6. MANUAL APPROVAL
+# ============================================================
+- stage: ManualApproval
+  displayName: 'Prod - Manual Approval'
+  dependsOn: TerraformPlan
+
+  jobs:
+  - job: approval
+    displayName: 'Approve Prod Apply'
+    pool: server
+    timeoutInMinutes: 1440
+
+    steps:
+    - task: ManualValidation@1
+      displayName: 'Approve Prod Apply'
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: 'YOUR_EMAIL@example.com'
+        instructions: |
+          PRODUCTION Terraform Plan review karein.
+          Yeh Production environment hai, isliye changes ko dhyan se check karne ke baad hi Approve karein.
+        onTimeout: 'reject'
+
+# ============================================================
+# 7. TERRAFORM APPLY
+# ============================================================
+- stage: TerraformApply
+  displayName: 'Prod - Terraform Apply'
+  dependsOn: ManualApproval
+
+  jobs:
+  - job: terraform_apply
+    displayName: 'Terraform Apply'
+
+    steps:
+    - checkout: self
+      clean: true
+
+    # -------------------------
+    # Download Approved Plan
+    # -------------------------
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Prod Plan'
+      inputs:
+        artifact: 'terraform-plan-prod'
+        path: '$(Pipeline.Workspace)/terraform-plan'
+
+    # -------------------------
+    # Terraform Init
+    # -------------------------
+    - task: TerraformTask@5
+      displayName: 'Terraform Init (Prod)'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        backendServiceArm: 'vikrantsc1'
+        backendAzureRmResourceGroupName: 'RG-Vikrant'
+        backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+        backendAzureRmContainerName: 'backendcontainer'
+        backendAzureRmKey: '$(backendKey)'
+
+    # -------------------------
+    # Terraform Apply
+    # -------------------------
+    - task: TerraformTask@5
+      displayName: 'Terraform Apply Approved Prod Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: 'vikrantsc1'
+        commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplan'
