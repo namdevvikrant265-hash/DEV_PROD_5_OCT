@@ -8,33 +8,23 @@ trigger:
       - modules/*
       - azure-pipelines.yml
 
-# Pipeline run karte waqt environment parameters
-parameters:
-  - name: environment
-    displayName: 'Select Environment'
-    type: string
-    default: 'dev'
-    allowed:
-      - dev
-
 pool:
   name: agentvikrant
 
-# Dev environment ke specific variables
 variables:
-  terraformWorkingDirectory: '$(Build.SourcesDirectory)/environments/dev'
-  backendStorageAccount: 'backendstoragedevvik'  # Apne Dev Storage Account ka naam yahan badlein
-  backendKey: 'terraform-dev.tfstate'
+  terraformWorkingDirectory: '$(Build.SourcesDirectory)/environments/preprod'
 
 stages:
 # ============================================================
 # 1. TERRAFORM SECURITY SCAN
 # ============================================================
 - stage: TerraformSecurityScan
-  displayName: 'Dev - Terraform Security Scan'
+  displayName: 'Terraform Security Scan'
+
   jobs:
   - job: tfsec
     displayName: 'Run TFSEC'
+
     steps:
     - checkout: self
       clean: true
@@ -46,10 +36,10 @@ stages:
         version: 'v1.26.0'
 
 # ============================================================
-# 2. TFLINT (parallel)
+# STAGE 2: TFLINT (parallel)
 # ============================================================
 - stage: TerraformTFLint
-  displayName: 'Dev - TFlint'
+  displayName: 'TFlint'
   jobs:
   - job: TFLint
     displayName: 'Run TFLint'
@@ -69,40 +59,8 @@ stages:
       displayName: 'Run TFLint Analyzer'
 
 # ============================================================
-# 3. CHECKOV
+# 2. TERRAFORM INIT + VALIDATE + PLAN
 # ============================================================
-- stage: TerraformCheckov
-  displayName: 'Dev - Checkov'
-  jobs:
-  - job: checkov
-    displayName: 'Run Checkov'
-    steps:
-    - checkout: self
-      clean: true
-   
-    - task: PublishTestResults@2
-      displayName: 'Publish Checkov Results'
-      condition: succeededOrFailed()
-      inputs:
-        testResultsFormat: 'JUnit'
-        testResultsFiles: '$(Build.ArtifactStagingDirectory)/checkov/**/*.xml'
-        testRunTitle: 'Checkov Dev Terraform Scan'
-        failTaskOnFailedTests: false
-
-# ============================================================
-# 4. TRIVY
-# ============================================================
-- stage: TerraformTrivy
-  displayName: 'Dev - Trivy'
-  dependsOn: []
-  jobs:
-  - job: trivy
-    displayName: 'Run Trivy Config Scan'
-    steps:
-    - checkout: self
-      clean: true
-      displayName: 'Run Trivy'
-
     - powershell: |
         Write-Host "Sources dir : $(Build.SourcesDirectory)"
         Write-Host "Work dir    : $(terraformWorkingDirectory)"
@@ -113,18 +71,15 @@ stages:
           Select-Object -First 30 -ExpandProperty FullName
       displayName: 'DEBUG paths'
       
-# ============================================================
-# 5. TERRAFORM INIT + VALIDATE + PLAN
-# ============================================================
 - stage: TerraformPlan
-  displayName: 'Dev - Init Validate Plan'
+  displayName: 'Terraform Init Validate Plan'
   dependsOn: TerraformSecurityScan
 
   jobs:
   - job: terraform_plan
     displayName: 'Terraform Init Validate Plan'
 
-   steps:
+    steps:
     - checkout: self
       clean: true
 
@@ -132,16 +87,17 @@ stages:
     # Terraform Init
     # -------------------------
     - task: TerraformTask@5
-      displayName: 'Terraform Init (Dev)'
+      displayName: 'Terraform Init'
       inputs:
         provider: 'azurerm'
         command: 'init'
         workingDirectory: '$(terraformWorkingDirectory)'
+
         backendServiceArm: 'vikrantsc1'
         backendAzureRmResourceGroupName: 'RG-Vikrant'
-        backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+        backendAzureRmStorageAccountName: 'backendstoragevik'
         backendAzureRmContainerName: 'backendcontainer'
-        backendAzureRmKey: '$(backendKey)'
+        backendAzureRmKey: 'terraform.tfstate'
 
     # -------------------------
     # Terraform Validate
@@ -169,39 +125,45 @@ stages:
     # Publish Terraform Plan
     # -------------------------
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Dev Plan'
+      displayName: 'Publish Terraform Plan'
       inputs:
         targetPath: '$(Build.ArtifactStagingDirectory)/tfplan'
-        artifact: 'terraform-plan-dev'
+        artifact: 'terraform-plan'
 
 # ============================================================
-# 6. MANUAL APPROVAL
+# 3. MANUAL APPROVAL
 # ============================================================
 - stage: ManualApproval
-  displayName: 'Dev - Manual Approval'
+  displayName: 'Manual Approval'
   dependsOn: TerraformPlan
 
   jobs:
   - job: approval
-    displayName: 'Approve Dev Apply'
+    displayName: 'Approve Terraform Apply'
     pool: server
+
     timeoutInMinutes: 1440
 
     steps:
     - task: ManualValidation@1
-      displayName: 'Approve Dev Apply'
+      displayName: 'Approve Terraform Apply'
       timeoutInMinutes: 1440
       inputs:
         notifyUsers: 'YOUR_EMAIL@example.com'
         instructions: |
-          Dev Terraform Plan review karein aur pipeline aage badhane ke liye Approve karein.
+          Terraform Plan has completed successfully.
+
+          Please review the Terraform Plan.
+
+          If the changes are approved, click Resume
+          to continue with Terraform Apply.
         onTimeout: 'reject'
 
 # ============================================================
-# 7. TERRAFORM APPLY
+# 4. TERRAFORM APPLY
 # ============================================================
 - stage: TerraformApply
-  displayName: 'Dev - Terraform Apply'
+  displayName: 'Terraform Apply'
   dependsOn: ManualApproval
 
   jobs:
@@ -216,34 +178,36 @@ stages:
     # Download Approved Plan
     # -------------------------
     - task: DownloadPipelineArtifact@2
-      displayName: 'Download Dev Plan'
+      displayName: 'Download Terraform Plan'
       inputs:
-        artifact: 'terraform-plan-dev'
+        artifact: 'terraform-plan'
         path: '$(Pipeline.Workspace)/terraform-plan'
 
     # -------------------------
     # Terraform Init
     # -------------------------
     - task: TerraformTask@5
-      displayName: 'Terraform Init (Dev)'
+      displayName: 'Terraform Init'
       inputs:
         provider: 'azurerm'
         command: 'init'
         workingDirectory: '$(terraformWorkingDirectory)'
+
         backendServiceArm: 'vikrantsc1'
         backendAzureRmResourceGroupName: 'RG-Vikrant'
-        backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+        backendAzureRmStorageAccountName: 'backendstoragevik'
         backendAzureRmContainerName: 'backendcontainer'
-        backendAzureRmKey: '$(backendKey)'
+        backendAzureRmKey: 'terraform.tfstate'
 
     # -------------------------
     # Terraform Apply
     # -------------------------
     - task: TerraformTask@5
-      displayName: 'Terraform Apply Approved Dev Plan'
+      displayName: 'Terraform Apply Approved Plan'
       inputs:
         provider: 'azurerm'
         command: 'apply'
         workingDirectory: '$(terraformWorkingDirectory)'
         environmentServiceNameAzureRM: 'vikrantsc1'
         commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplan'
+
