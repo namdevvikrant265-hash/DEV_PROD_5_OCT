@@ -1,2 +1,0 @@
-# DEV_PROD_5_OCT-
-DEV PROD
